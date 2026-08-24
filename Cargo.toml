@@ -11,3 +11,6 @@ smithay-client-toolkit = { version = "0.20.0", default-features = false, feature
 libc = "0.2"
 paste = "1.0"
 log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11.11"

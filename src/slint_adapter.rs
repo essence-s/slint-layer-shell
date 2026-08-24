@@ -30,15 +30,13 @@ impl Platform for SlintPlatform {
         if let Some(val) = arguments.as_str() {
             log::info!("{val}");
         } else {
-            log::info!("{}", arguments.to_string());
+            log::info!("{arguments}");
         }
     }
 
     fn new_event_loop_proxy(&self) -> Option<Box<dyn EventLoopProxy>> {
-        Some(Box::new(SlintEventProxy(
-            ADAPTERS.with(|v| v.borrow().last().unwrap().slint_event_proxy.clone()),
-            ADAPTERS.with(|v| v.borrow().last().unwrap().eventfd),
-        )))
+        let (queue, fd) = crate::wayland_adapter::proxy_handles();
+        Some(Box::new(SlintEventProxy(queue, fd)))
     }
 }
 

@@ -11,12 +11,9 @@ use smithay_client_toolkit::{
     shm::slot::{Buffer, Slot, SlotPool},
 };
 use std::{
-    cell::Cell,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt::Debug,
-    os::unix::io::RawFd,
     rc::{Rc, Weak},
-    sync::{Arc, Mutex},
 };
 
 pub struct SkiaSoftwareBufferReal {
@@ -28,7 +25,7 @@ pub struct SkiaSoftwareBufferReal {
 
 impl SkiaSoftwareBufferReal {
     fn refresh_buffer(&self, width: i32, height: i32) -> Buffer {
-        let stride = width as i32 * 4;
+        let stride = width * 4;
         let (buffer, _raw_canvas) = self
             .pool
             .borrow_mut()
@@ -82,9 +79,6 @@ pub struct SkiaWindowAdapter {
     pub(crate) buffer_slint: Rc<SkiaSoftwareBufferReal>,
     pub(crate) needs_redraw: Cell<bool>,
     pub(crate) scale_factor: Cell<f32>,
-    #[allow(clippy::type_complexity)]
-    pub(crate) slint_event_proxy: Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>,
-    pub(crate) eventfd: RawFd,
     pub(crate) current_cursor: Cell<MouseCursor>,
 }
 
@@ -135,14 +129,12 @@ impl WindowAdapter for SkiaWindowAdapter {
 }
 
 impl SkiaWindowAdapter {
-    #[allow(clippy::type_complexity)]
     pub fn new(
         pool: Rc<RefCell<SlotPool>>,
         primary_slot: RefCell<Slot>,
         width: u32,
         height: u32,
-        slint_proxy: Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>,
-        eventfd: RawFd,
+        skia_ctx: &SkiaSharedContext,
     ) -> Rc<Self> {
         let buffer = Rc::new(SkiaSoftwareBufferReal {
             primary_slot,
@@ -150,10 +142,8 @@ impl SkiaWindowAdapter {
             last_dirty_region: Default::default(),
             is_buffer_fresh: Cell::new(true),
         });
-        let renderer = SkiaRenderer::new_with_surface(
-            &SkiaSharedContext::default(),
-            Box::new(SoftwareSurface::from(buffer.clone())),
-        );
+        let renderer =
+            SkiaRenderer::new_with_surface(skia_ctx, Box::new(SoftwareSurface::from(buffer.clone())));
         Rc::new_cyclic(|w: &Weak<Self>| Self {
             window: slint::Window::new(w.clone()),
             size: Cell::new(PhysicalSize { width, height }),
@@ -162,8 +152,6 @@ impl SkiaWindowAdapter {
             buffer_slint: buffer,
             scale_factor: Cell::new(1.),
             needs_redraw: Cell::new(true),
-            slint_event_proxy: slint_proxy,
-            eventfd,
             current_cursor: Cell::new(MouseCursor::Default),
         })
     }

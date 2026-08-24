@@ -31,7 +31,6 @@ macro_rules! windows {
                     pub fn hide(&self) {
                         self.way.hide();
                     }
-
                     pub fn show_again(&mut self) {
                         self.way.show_again();
                     }
@@ -69,7 +68,7 @@ macro_rules! windows {
                     }
 
                     pub fn get_handler(&self) -> WinHandle {
-                        WinHandle(self.way.loop_handle.clone())
+                        self.way.get_handler()
                     }
 
                     pub fn parts(self) -> ($slint_win, WaylandWindow) {
@@ -82,15 +81,13 @@ macro_rules! windows {
                     fn on_call(
                         &mut self,
                     ) -> Result<(), Box<dyn std::error::Error>> {
-                        let event_loop = self.way.event_loop.clone();
-                        event_loop
-                            .borrow_mut()
-                            .dispatch(Some(std::time::Duration::ZERO), &mut self.way)?;
+                        // All windows share one event loop owned by the app;
+                        // `run_event_loop` drives it directly.
                         Ok(())
                     }
 
                     fn get_span(&self) -> String {
-                        self.way.span.clone()
+                        self.way.span().to_string()
                     }
                 }
 

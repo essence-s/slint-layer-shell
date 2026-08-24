@@ -20,7 +20,6 @@ pub mod macro_internal {
 }
 
 use std::error::Error;
-use std::time::Duration;
 
 pub trait WindowHandler: std::fmt::Debug {
     fn on_call(&mut self) -> Result<(), Box<dyn Error>>;
@@ -34,12 +33,11 @@ pub trait WindowHandler: std::fmt::Debug {
     }
 }
 
+/// Runs the single shared event loop until an error occurs.
+///
+/// The loop is fully event-driven: it sleeps in the kernel until a wayland
+/// event, a queued slint task or a timer/animation tick arrives. Idle CPU
+/// usage is ~0% regardless of how many windows were spawned.
 pub fn run_event_loop(mut windows: Vec<Box<dyn WindowHandler>>) -> Result<(), Box<dyn Error>> {
-    loop {
-        for win in windows.iter_mut() {
-            let _span = win.get_span();
-            win.on_call()?;
-        }
-        std::thread::sleep(Duration::from_millis(16));
-    }
+    crate::wayland_adapter::start_event_loop(&mut windows)
 }

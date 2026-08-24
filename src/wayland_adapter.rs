@@ -10,7 +10,9 @@ use crate::{
     },
 };
 use i_slint_core::items::MouseCursor;
-use slint::platform::WindowAdapter;
+use i_slint_core::timers::TimerList;
+use i_slint_renderer_skia::SkiaSharedContext;
+use slint::platform::{WindowAdapter, WindowEvent};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
@@ -20,9 +22,14 @@ use smithay_client_toolkit::{
         calloop::{EventLoop, LoopHandle},
         calloop_wayland_source::WaylandSource,
         client::{
-            Connection, EventQueue, QueueHandle,
+            Connection, QueueHandle,
             globals::registry_queue_init,
-            protocol::{wl_keyboard::WlKeyboard, wl_output, wl_shm, wl_surface, wl_touch::WlTouch},
+            protocol::{
+                wl_keyboard::WlKeyboard,
+                wl_output,
+                wl_shm,
+                wl_surface,
+            },
         },
     },
     registry::{ProvidesRegistryState, RegistryState},
@@ -42,8 +49,10 @@ use smithay_client_toolkit::{
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    error::Error,
+    os::unix::io::RawFd,
     rc::Rc,
-    sync::{Arc, Mutex, Once, OnceLock, RwLock},
+    sync::{Arc, Mutex, Once},
 };
 
 mod fractional_scaling;
@@ -52,252 +61,318 @@ mod viewporter;
 mod way_helper;
 mod win_impl;
 
-static AVAILABLE_MONITORS: OnceLock<RwLock<HashMap<String, wl_output::WlOutput>>> = OnceLock::new();
 static SET_SLINT_PLATFORM: Once = Once::new();
 
-#[derive(Debug)]
-pub(crate) struct States {
+#[allow(clippy::type_complexity)]
+pub(crate) type SlintTaskQueue = Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>>;
+pub(crate) type Qh = QueueHandle<AppData>;
+
+thread_local! {
+    static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// Slint task queue + wakeup fd, deliberately stored OUTSIDE `App`:
+    /// the slint platform creates its event proxy during `set_platform()`,
+    /// which happens *inside* `ensure_app()` while `APP` is already
+    /// mutably borrowed.
+    static SLINT_EVENTS: SlintTaskQueue = Arc::new(Mutex::new(Vec::new()));
+    static SLINT_EVENTFD: Cell<RawFd> = const { Cell::new(-1) };
+}
+
+pub(crate) fn slint_task_queue() -> SlintTaskQueue {
+    SLINT_EVENTS.with(|q| q.clone())
+}
+
+pub(crate) fn slint_eventfd() -> RawFd {
+    SLINT_EVENTFD.with(Cell::get)
+}
+
+struct App {
+    event_loop: EventLoop<'static, AppData>,
+    data: AppData,
+    qh: Qh,
+}
+
+/// One shared Wayland application state for every window:
+/// a single connection, a single event queue, a single calloop loop and one
+/// set of bound globals. Each window only owns its surface-specific pieces.
+pub(crate) struct AppData {
+    pub(crate) shared: SharedStates,
+    #[allow(clippy::type_complexity)]
+    pub(crate) slint_events: SlintTaskQueue,
+    pub(crate) windows: Vec<WaylandWindow>,
+    /// Routes incoming events (keyed by wl_surface) to the owning window.
+    pub(crate) surfaces: HashMap<wl_surface::WlSurface, usize>,
+    pub(crate) keyboard_focus: Option<usize>,
+}
+
+pub(crate) struct SharedStates {
     pub(crate) registry_state: RegistryState,
     pub(crate) seat_state: SeatState,
     pub(crate) output_state: OutputState,
+    pub(crate) compositor: CompositorState,
+    pub(crate) layer_shell: LayerShell,
+    pub(crate) shm: Shm,
+    pub(crate) cursor_manager: CursorShapeManager,
+    pub(crate) fractional_scale: FractionalScaleState,
+    pub(crate) viewporter_state: ViewporterState,
+    /// One Skia context shared by every window renderer.
+    pub(crate) skia_ctx: SkiaSharedContext,
+    pub(crate) monitors: HashMap<String, wl_output::WlOutput>,
     pub(crate) pointer_state: PointerState,
     pub(crate) keyboard_state: Option<WlKeyboard>,
-    pub(crate) touch_state: Option<WlTouch>,
-    pub(crate) shm: Shm,
-    pub(crate) viewporter: Option<Viewport>,
 }
 
-pub struct WaylandWindow {
-    pub(crate) adapter: Rc<SkiaWindowAdapter>,
-    pub loop_handle: LoopHandle<'static, WaylandWindow>,
-    pub(crate) buffer: Buffer,
-    pub(crate) states: States,
-    pub(crate) layer: Option<LayerSurface>,
-    pub(crate) first_configure: Cell<bool>,
-    pub(crate) natural_scroll: bool,
-    pub(crate) is_hidden: Cell<bool>,
-    pub layer_name: String,
-    pub(crate) config: WindowConf,
-    pub(crate) input_region: Region,
-    pub(crate) opaque_region: Region,
-    pub event_loop: Rc<RefCell<EventLoop<'static, WaylandWindow>>>,
-    pub span: String,
-}
+#[derive(Clone)]
+pub struct WaylandWindow(pub(crate) Rc<WaylandWindowInner>);
 
 impl std::fmt::Debug for WaylandWindow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaylandWindow")
-            .field("adapter", &self.adapter)
-            .field("first_configure", &self.first_configure)
-            .field("is_hidden", &self.is_hidden)
-            .field("config", &self.config)
+            .field("adapter", &self.0.adapter)
+            .field("first_configure", &self.0.first_configure)
+            .field("configured", &self.0.configured)
+            .field("is_hidden", &self.0.is_hidden)
             .finish()
     }
 }
 
-impl WaylandWindow {
-    pub(crate) fn create_window(
-        conn: &Connection,
-        window_conf: WindowConf,
-        layer_name: String,
-    ) -> Self {
-        let (globals, mut event_queue) = registry_queue_init(conn).unwrap();
-        let qh: QueueHandle<WaylandWindow> = event_queue.handle();
+pub(crate) struct WaylandWindowInner {
+    pub(crate) id: usize,
+    pub(crate) adapter: Rc<SkiaWindowAdapter>,
+    pub(crate) buffer: RefCell<Buffer>,
+    pub(crate) layer: LayerSurface,
+    pub(crate) viewport: Viewport,
+    pub(crate) config: RefCell<WindowConf>,
+    pub(crate) input_region: Region,
+    pub(crate) opaque_region: Region,
+    pub(crate) first_configure: Cell<bool>,
+    /// True once the layer surface received its first configure; buffers may
+    /// only be attached afterwards (protocol requirement).
+    pub(crate) configured: Cell<bool>,
+    pub(crate) natural_scroll: bool,
+    pub(crate) is_hidden: Cell<bool>,
+    pub(crate) loop_handle: LoopHandle<'static, AppData>,
+    pub(crate) span: String,
+    pub(crate) layer_name: String,
+}
+
+fn ensure_app() {
+    APP.with_borrow_mut(|slot| {
+        if slot.is_some() {
+            return;
+        }
+        let conn =
+            Connection::connect_to_env().expect("Failed to connect to the Wayland compositor");
+        let (globals, mut event_queue) =
+            registry_queue_init::<AppData>(&conn).expect("Failed to init the registry queue");
+        let qh: Qh = event_queue.handle();
 
         let compositor =
             CompositorState::bind(&globals, &qh).expect("wl_compositor is not available");
-        let event_loop: EventLoop<'static, WaylandWindow> =
-            EventLoop::try_new().expect("Failed to initialize the event loop!");
         let layer_shell = LayerShell::bind(&globals, &qh).expect("layer shell is not available");
         let shm = Shm::bind(&globals, &qh).expect("wl_shm is not available");
-        let mut pool = SlotPool::new((window_conf.width * window_conf.height * 4) as usize, &shm)
-            .expect("Failed to create pool");
-        let input_region = Region::new(&compositor).expect("Couldn't create region");
-        let opaque_region = Region::new(&compositor).expect("Couldn't create opaque region");
-        input_region.add(0, 0, window_conf.width as i32, window_conf.height as i32);
         let cursor_manager =
             CursorShapeManager::bind(&globals, &qh).expect("cursor shape is not available");
-        let fractional_scale_state: FractionalScaleState =
-            FractionalScaleState::bind(&globals, &qh).expect("Fractional Scale couldn't be set");
-        let stride = window_conf.width as i32 * 4;
-
-        let surface = compositor.create_surface(&qh);
+        let fractional_scale = FractionalScaleState::bind(&globals, &qh)
+            .expect("Fractional Scale couldn't be set");
         let viewporter_state =
             ViewporterState::bind(&globals, &qh).expect("Couldn't set viewporter");
 
-        let (way_pri_buffer, _) = pool
-            .create_buffer(
-                window_conf.width as i32,
-                window_conf.height as i32,
-                stride,
-                wl_shm::Format::Argb8888,
-            )
-            .expect("Creating Buffer");
-
-        let primary_slot = way_pri_buffer.slot();
-
-        let pointer_state = PointerState {
-            pointer: None,
-            cursor_shape: cursor_manager,
-            current_wayland_cursor: MouseCursor::Default,
-            last_cursor_enter_serial: None,
-        };
-
-        let eventfd_fd = unsafe {
-            libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_NONBLOCK)
-        };
+        let eventfd_fd = unsafe { libc::eventfd(0, libc::EFD_SEMAPHORE | libc::EFD_NONBLOCK) };
         if eventfd_fd == -1 {
             panic!("eventfd creation failed: {}", std::io::Error::last_os_error());
         }
+        SLINT_EVENTFD.with(|c| c.set(eventfd_fd));
 
-        #[allow(clippy::type_complexity)]
-        let slint_proxy: Arc<Mutex<Vec<Box<dyn FnOnce() + Send>>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let adapter_value: Rc<SkiaWindowAdapter> = SkiaWindowAdapter::new(
-            Rc::new(RefCell::new(pool)),
-            RefCell::new(primary_slot),
-            window_conf.width,
-            window_conf.height,
-            slint_proxy.clone(),
-            eventfd_fd,
-        );
-
-        ADAPTERS.with_borrow_mut(|v| v.push(adapter_value.clone()));
-        SET_SLINT_PLATFORM.call_once(|| {
-            log::trace!("Slint platform set");
-            if let Err(err) = slint::platform::set_platform(Box::new(SlintPlatform::default())) {
-                log::warn!("Error setting slint platform: {err}");
-            }
-        });
-        set_event_sources(&event_loop, eventfd_fd);
-
-        let mut win = WaylandWindow {
-            adapter: adapter_value,
-            loop_handle: event_loop.handle(),
-            buffer: way_pri_buffer,
-            states: States {
+        let mut data = AppData {
+            shared: SharedStates {
                 registry_state: RegistryState::new(&globals),
                 seat_state: SeatState::new(&globals, &qh),
                 output_state: OutputState::new(&globals, &qh),
-                pointer_state,
-                keyboard_state: None,
-                touch_state: None,
+                compositor,
+                layer_shell,
                 shm,
-                viewporter: None,
+                cursor_manager,
+                fractional_scale,
+                viewporter_state,
+                skia_ctx: SkiaSharedContext::default(),
+                monitors: HashMap::new(),
+                pointer_state: PointerState {
+                    pointer: None,
+                    current_wayland_cursor: MouseCursor::Default,
+                    last_cursor_enter_serial: None,
+                },
+                keyboard_state: None,
             },
-            layer: None,
-            first_configure: Cell::new(true),
-            natural_scroll: window_conf.natural_scroll,
-            is_hidden: Cell::new(false),
-            layer_name: layer_name.clone(),
-            config: window_conf.clone(),
-            input_region,
-            opaque_region,
-            event_loop: Rc::new(RefCell::new(event_loop)),
-            span: layer_name.clone(),
+            slint_events: slint_task_queue(),
+            windows: Vec::new(),
+            surfaces: HashMap::new(),
+            keyboard_focus: None,
         };
 
-        if AVAILABLE_MONITORS.get().is_none() {
-            match WaylandWindow::get_available_monitors(&mut event_queue, &mut win) {
-                Some(monitors) => {
-                    let _ = AVAILABLE_MONITORS.get_or_init(|| RwLock::new(monitors));
-                }
-                None => log::warn!("Failed to get available monitors"),
-            }
+        let event_loop: EventLoop<'static, AppData> =
+            EventLoop::try_new().expect("Failed to initialize the event loop!");
+        set_event_sources(event_loop.handle(), eventfd_fd, qh.clone());
+
+        // Discover outputs once with a single roundtrip.
+        if event_queue.roundtrip(&mut data).is_ok() {
+            let outputs: HashMap<String, wl_output::WlOutput> = data
+                .shared
+                .output_state
+                .outputs()
+                .filter_map(|output| {
+                    let info = data.shared.output_state.info(&output)?;
+                    Some((info.name?, output))
+                })
+                .collect();
+            data.shared.monitors = outputs;
+        } else {
+            log::warn!("Initial roundtrip failed; monitor discovery skipped");
         }
 
+        WaylandSource::new(conn.clone(), event_queue)
+            .insert(event_loop.handle())
+            .expect("Failed to register the wayland source");
+
+        SET_SLINT_PLATFORM.call_once(|| {
+            log::trace!("Slint platform set");
+            if let Err(err) = slint::platform::set_platform(Box::new(SlintPlatform)) {
+                log::warn!("Error setting slint platform: {err}");
+            }
+        });
+
+        *slot = Some(App { event_loop, data, qh });
+    });
+}
+
+impl WaylandWindow {
+    pub fn spawn(name: &str, window_conf: WindowConf) -> Self {
+        ensure_app();
+        APP.with_borrow_mut(|slot| {
+            let app = slot.as_mut().expect("slint-layer-shell app must be initialized");
+            Self::create_window(app, name.to_string(), window_conf)
+        })
+    }
+
+    fn create_window(app: &mut App, layer_name: String, window_conf: WindowConf) -> Self {
+        let qh = app.qh.clone();
+        let width = window_conf.width;
+        let height = window_conf.height;
+        let natural_scroll = window_conf.natural_scroll;
+
+        let surface = app.data.shared.compositor.create_surface(&qh);
+
         let target_output: Option<wl_output::WlOutput> =
-            if let Some(name) = &window_conf.monitor_name {
-                let output = AVAILABLE_MONITORS
-                    .get()
-                    .and_then(|monitors| monitors.read().ok())
-                    .and_then(|monitors| monitors.get(name).cloned());
+            window_conf.monitor_name.as_ref().and_then(|name| {
+                let output = app.data.shared.monitors.get(name).cloned();
                 if output.is_none() {
-                    log::warn!("Monitor '{}' not found, using default monitor", name);
+                    log::warn!("Monitor '{name}' not found, using default monitor");
                 }
                 output
-            } else {
-                None
-            };
+            });
 
-        let layer = layer_shell.create_layer_surface(
+        let layer = app.data.shared.layer_shell.create_layer_surface(
             &qh,
-            surface,
+            surface.clone(),
             window_conf.layer_type,
             Some(layer_name.clone()),
             target_output.as_ref(),
         );
-        let fractional_scale = fractional_scale_state.get_scale(layer.wl_surface(), &qh);
 
-        let viewporter = viewporter_state.get_viewport(layer.wl_surface(), &qh, fractional_scale);
-
-        set_config(
-            &win.config,
-            &layer,
-            Some(win.input_region.wl_region()),
-            None,
+        let fractional_scale =
+            app.data.shared.fractional_scale.get_scale(layer.wl_surface(), &qh);
+        let viewport = app.data.shared.viewporter_state.get_viewport(
+            layer.wl_surface(),
+            &qh,
+            fractional_scale,
         );
+
+        let stride = width as i32 * 4;
+        let mut pool =
+            SlotPool::new((width * height * 4) as usize, &app.data.shared.shm)
+                .expect("Failed to create pool");
+        let (way_pri_buffer, _) = pool
+            .create_buffer(width as i32, height as i32, stride, wl_shm::Format::Argb8888)
+            .expect("Creating Buffer");
+        let primary_slot = way_pri_buffer.slot();
+
+        let input_region =
+            Region::new(&app.data.shared.compositor).expect("Couldn't create region");
+        let opaque_region =
+            Region::new(&app.data.shared.compositor).expect("Couldn't create opaque region");
+        input_region.add(0, 0, width as i32, height as i32);
+
+        set_config(&window_conf, &layer, Some(input_region.wl_region()), None);
         layer.commit();
 
-        win.layer = Some(layer);
-        win.states.viewporter = Some(viewporter);
+        let adapter_value = SkiaWindowAdapter::new(
+            Rc::new(RefCell::new(pool)),
+            RefCell::new(primary_slot),
+            width,
+            height,
+            &app.data.shared.skia_ctx,
+        );
+        ADAPTERS.with_borrow_mut(|v| v.push(adapter_value.clone()));
 
-        log::info!("Win: {} layer created successfully.", layer_name);
+        let id = app.data.windows.len();
+        app.data.surfaces.insert(surface, id);
 
-        WaylandSource::new(conn.clone(), event_queue)
-            .insert(win.loop_handle.clone())
-            .unwrap();
+        let win = WaylandWindow(Rc::new(WaylandWindowInner {
+            id,
+            adapter: adapter_value,
+            buffer: RefCell::new(way_pri_buffer),
+            layer,
+            viewport,
+            config: RefCell::new(window_conf),
+            input_region,
+            opaque_region,
+            first_configure: Cell::new(true),
+            configured: Cell::new(false),
+            natural_scroll,
+            is_hidden: Cell::new(false),
+            loop_handle: app.event_loop.handle(),
+            span: layer_name.clone(),
+            layer_name,
+        }));
+        app.data.windows.push(win.clone());
+
+        log::info!("Win: {} layer created successfully.", win.0.span);
         win
     }
 
-    fn get_available_monitors(
-        event_queue: &mut EventQueue<WaylandWindow>,
-        win: &mut WaylandWindow,
-    ) -> Option<HashMap<String, wl_output::WlOutput>> {
-        event_queue.roundtrip(win).ok()?;
-
-        Some(
-            win.states
-                .output_state
-                .outputs()
-                .filter_map(|output| {
-                    let info = win.states.output_state.info(&output)?;
-                    Some((info.name?, output))
-                })
-                .collect(),
-        )
-    }
-
-    pub fn get_handler(&self) -> WinHandle {
-        log::info!("Win: Handle provided.");
-        WinHandle(self.loop_handle.clone())
-    }
-
-    pub fn spawn(name: &str, window_conf: WindowConf) -> Self {
-        let conn = Connection::connect_to_env().unwrap();
-        WaylandWindow::create_window(&conn, window_conf.clone(), name.to_string())
-    }
-
     pub fn hide(&self) {
-        if !self.is_hidden.replace(true) {
-            log::info!("Win: Hiding window");
-            self.layer.as_ref().unwrap().wl_surface().attach(None, 0, 0);
-            self.layer.as_ref().unwrap().commit();
+        let inner = &*self.0;
+        if !inner.is_hidden.replace(true) {
+            log::info!("Win: Hiding window {}", inner.span);
+            let layer = &inner.layer;
+            layer.wl_surface().attach(None, 0, 0);
+            layer.commit();
         }
     }
 
     pub fn show_again(&self) {
-        if self.is_hidden.replace(false) {
-            log::info!("Win: Showing window again");
-            self.set_config_internal();
-            self.first_configure.set(true);
-            self.layer.as_ref().unwrap().commit();
+        let inner = &*self.0;
+        if inner.is_hidden.replace(false) {
+            log::info!("Win: Showing window again {}", inner.span);
+            {
+                let config = inner.config.borrow();
+                set_config(
+                    &config,
+                    &inner.layer,
+                    Some(inner.input_region.wl_region()),
+                    Some(inner.opaque_region.wl_region()),
+                );
+            }
+            // Re-applying layer state requires waiting for a fresh configure
+            // round: attaching a buffer before it is a protocol error.
+            inner.first_configure.set(true);
+            inner.configured.set(false);
+            inner.layer.commit();
         }
     }
 
     pub fn toggle(&self) {
-        log::info!("Win: view toggled");
-        if self.is_hidden.get() {
+        log::info!("Win: view toggled {}", self.0.span);
+        if self.0.is_hidden.get() {
             self.show_again();
         } else {
             self.hide();
@@ -305,169 +380,323 @@ impl WaylandWindow {
     }
 
     pub fn add_input_region(&self, x: i32, y: i32, width: i32, height: i32) {
+        let inner = &*self.0;
         log::info!(
-            "Win: input region added: [x: {}, y: {}, width: {}, height: {}]",
-            x, y, width, height
+            "Win: {} input region added: [x: {}, y: {}, width: {}, height: {}]",
+            inner.span, x, y, width, height
         );
-        self.input_region.add(x, y, width, height);
-        self.set_config_internal();
-        self.layer.as_ref().unwrap().commit();
+        inner.input_region.add(x, y, width, height);
+        self.apply_regions_and_commit();
     }
 
     pub fn subtract_input_region(&self, x: i32, y: i32, width: i32, height: i32) {
+        let inner = &*self.0;
         log::info!(
-            "Win: input region removed: [x: {}, y: {}, width: {}, height: {}]",
-            x, y, width, height
+            "Win: {} input region removed: [x: {}, y: {}, width: {}, height: {}]",
+            inner.span, x, y, width, height
         );
-        self.input_region.subtract(x, y, width, height);
-        self.set_config_internal();
-        self.layer.as_ref().unwrap().commit();
+        inner.input_region.subtract(x, y, width, height);
+        self.apply_regions_and_commit();
     }
 
     pub fn add_opaque_region(&self, x: i32, y: i32, width: i32, height: i32) {
+        let inner = &*self.0;
         log::info!(
-            "Win: opaque region added: [x: {}, y: {}, width: {}, height: {}]",
-            x, y, width, height
+            "Win: {} opaque region added: [x: {}, y: {}, width: {}, height: {}]",
+            inner.span, x, y, width, height
         );
-        self.opaque_region.add(x, y, width, height);
-        self.set_config_internal();
-        self.layer.as_ref().unwrap().commit();
+        inner.opaque_region.add(x, y, width, height);
+        self.apply_regions_and_commit();
     }
 
     pub fn subtract_opaque_region(&self, x: i32, y: i32, width: i32, height: i32) {
+        let inner = &*self.0;
         log::info!(
-            "Win: opaque region removed: [x: {}, y: {}, width: {}, height: {}]",
-            x, y, width, height
+            "Win: {} opaque region removed: [x: {}, y: {}, width: {}, height: {}]",
+            inner.span, x, y, width, height
         );
-        self.opaque_region.subtract(x, y, width, height);
-        self.set_config_internal();
-        self.layer.as_ref().unwrap().commit();
+        inner.opaque_region.subtract(x, y, width, height);
+        self.apply_regions_and_commit();
     }
 
-    fn set_config_internal(&self) {
-        set_config(
-            &self.config,
-            self.layer.as_ref().unwrap(),
-            Some(self.input_region.wl_region()),
-            Some(self.opaque_region.wl_region()),
-        );
-    }
-
-    fn converter(&mut self, qh: &QueueHandle<Self>) {
+    fn apply_regions_and_commit(&self) {
+        let inner = &*self.0;
         {
-            let proxy = self.adapter.slint_event_proxy.clone();
-            if let Ok(mut list) = proxy.try_lock()
-                && !(*list).is_empty()
-            {
-                let events: Vec<_> = (*list).drain(..).collect();
-                drop(list);
-                for event in events {
-                    event();
-                }
-            }
+            let config = inner.config.borrow();
+            set_config(
+                &config,
+                &inner.layer,
+                Some(inner.input_region.wl_region()),
+                Some(inner.opaque_region.wl_region()),
+            );
         }
-
-        slint::platform::update_timers_and_animations();
-        let width: u32 = self.adapter.size.get().width;
-        let height: u32 = self.adapter.size.get().height;
-        let window_adapter = self.adapter.clone();
-
-        if !self.is_hidden.get() {
-            let redraw_val: bool = window_adapter.draw_if_needed();
-
-            log::trace!("[conv] {} hidden={} fc={} redraw={} size={}x{}",
-                self.span, self.is_hidden.get(), self.first_configure.get(), redraw_val, width, height);
-
-            self.states
-                .pointer_state
-                .update_cursor(self.adapter.current_cursor.get(), &qh);
-
-            let buffer = &self.buffer;
-            if self.first_configure.get() || redraw_val {
-                self.first_configure.set(false);
-                log::info!("[conv] {} attaching buffer", self.span);
-                let surface = self.layer.as_ref().unwrap().wl_surface();
-                let dirty = self.adapter.buffer_slint.last_dirty_region.borrow();
-                if let Some(ref dirty) = *dirty {
-                    let scale = self.adapter.scale_factor.get();
-                    for box2d in dirty.iter() {
-                        let phys = (box2d.to_rect() * scale).round_out();
-                        surface.damage_buffer(
-                            phys.min_x() as i32,
-                            phys.min_y() as i32,
-                            phys.width() as i32,
-                            phys.height() as i32,
-                        );
-                    }
-                } else {
-                    surface.damage_buffer(0, 0, width as i32, height as i32);
-                }
-                surface.attach(Some(buffer.wl_buffer()), 0, 0);
-            }
-
-            self.layer
-                .as_ref()
-                .unwrap()
-                .wl_surface()
-                .frame(qh, self.layer.as_ref().unwrap().wl_surface().clone());
-            self.layer.as_ref().unwrap().commit();
-        }
+        inner.layer.commit();
     }
 
     pub fn grab_focus(&self) {
-        if !self.is_hidden.get()
-            && self.config.board_interactivity.get() != KeyboardInteractivity::Exclusive
+        let inner = &*self.0;
+        if !inner.is_hidden.get()
+            && inner.config.borrow().board_interactivity.get() != KeyboardInteractivity::Exclusive
         {
-            self.config
-                .board_interactivity
-                .set(KeyboardInteractivity::Exclusive);
-            self.layer
-                .as_ref()
-                .unwrap()
-                .set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-            self.layer.as_ref().unwrap().commit();
+            inner.config.borrow().board_interactivity.set(KeyboardInteractivity::Exclusive);
+            inner.layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+            // Keyboard interactivity is layer state -> wait for re-configure.
+            inner.configured.set(false);
+            inner.layer.commit();
         }
     }
 
     pub fn remove_focus(&self) {
-        if !self.is_hidden.get()
-            && self.config.board_interactivity.get() != KeyboardInteractivity::None
+        let inner = &*self.0;
+        if !inner.is_hidden.get()
+            && inner.config.borrow().board_interactivity.get() != KeyboardInteractivity::None
         {
-            self.config
-                .board_interactivity
-                .set(KeyboardInteractivity::None);
-            self.layer
-                .as_ref()
-                .unwrap()
-                .set_keyboard_interactivity(KeyboardInteractivity::None);
-            self.layer.as_ref().unwrap().commit();
+            inner.config.borrow().board_interactivity.set(KeyboardInteractivity::None);
+            inner.layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+            inner.configured.set(false);
+            inner.layer.commit();
         }
     }
 
-    pub fn set_exclusive_zone(&mut self, val: i32) {
-        self.config.exclusive_zone = Some(val);
-        self.layer.as_ref().unwrap().set_exclusive_zone(val);
-        self.layer.as_ref().unwrap().commit();
+    pub fn set_exclusive_zone(&self, val: i32) {
+        let inner = &*self.0;
+        inner.config.borrow_mut().exclusive_zone = Some(val);
+        inner.layer.set_exclusive_zone(val);
+        // Exclusive zone is layer state -> wait for re-configure.
+        inner.configured.set(false);
+        inner.layer.commit();
+    }
+
+    pub fn get_handler(&self) -> WinHandle {
+        log::info!("Win: {} handle provided.", self.0.span);
+        WinHandle { handle: self.0.loop_handle.clone(), idx: self.0.id }
+    }
+
+    pub fn layer_name(&self) -> &str {
+        &self.0.layer_name
+    }
+
+    pub fn span(&self) -> &str {
+        &self.0.span
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.0.is_hidden.get()
     }
 }
 
 impl WindowHandler for WaylandWindow {
-    fn on_call(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let event_loop = self.event_loop.clone();
-        event_loop
-            .borrow_mut()
-            .dispatch(None::<std::time::Duration>, self)?;
+    fn on_call(&mut self) -> Result<(), Box<dyn Error>> {
         Ok(())
     }
 
     fn get_span(&self) -> String {
-        self.span.clone()
+        self.0.span.clone()
     }
 }
 
-impl ProvidesRegistryState for WaylandWindow {
+impl AppData {
+    fn drain_slint_events(&mut self) {
+        if let Ok(mut list) = self.slint_events.try_lock()
+            && !list.is_empty()
+        {
+            let events: Vec<_> = list.drain(..).collect();
+            drop(list);
+            for event in events {
+                event();
+            }
+        }
+    }
+
+    /// Process all pending work: queued slint closures, timer/animation ticks
+    /// and rendering of every window that actually needs a new frame.
+    pub(crate) fn sweep(&mut self, qh: &Qh) {
+        self.drain_slint_events();
+        slint::platform::update_timers_and_animations();
+        for idx in 0..self.windows.len() {
+            self.render_window(idx, qh);
+        }
+    }
+
+    /// Draw + commit only when the window has pending work. The wayland
+    /// frame-callback chain is only kept alive while animations/timers are
+    /// active, so an idle desktop shell costs zero wakeups.
+    fn render_window(&mut self, idx: usize, qh: &Qh) {
+        let Some(win) = self.windows.get(idx) else { return };
+        let inner = &*win.0;
+
+        if inner.is_hidden.get() || !inner.configured.get() {
+            return;
+        }
+        // Query the flags WITHOUT consuming them: draw_if_needed() consumes
+        // needs_redraw itself and only paints when it was set.
+        let first_configure = inner.first_configure.get();
+        if !first_configure && !inner.adapter.needs_redraw.get() {
+            return;
+        }
+
+        inner.adapter.draw_if_needed();
+        inner.first_configure.set(false);
+
+        let size = inner.adapter.size.get();
+        let surface = inner.layer.wl_surface();
+
+        {
+            let dirty = inner.adapter.buffer_slint.last_dirty_region.borrow();
+            if let Some(ref region) = *dirty {
+                let scale = inner.adapter.scale_factor.get();
+                for box2d in region.iter() {
+                    let phys = (box2d.to_rect() * scale).round_out();
+                    surface.damage_buffer(
+                        phys.min_x() as i32,
+                        phys.min_y() as i32,
+                        phys.width() as i32,
+                        phys.height() as i32,
+                    );
+                }
+            } else {
+                surface.damage_buffer(0, 0, size.width as i32, size.height as i32);
+            }
+        }
+
+        surface.attach(Some(inner.buffer.borrow().wl_buffer()), 0, 0);
+
+        // Only keep requesting frame callbacks while there is queued work;
+        // otherwise let the whole process sleep until something happens.
+        let animating =
+            TimerList::next_timeout().is_some() || inner.adapter.needs_redraw.get();
+        if animating {
+            surface.frame(qh, surface.clone());
+        }
+        surface.commit();
+
+        self.shared.pointer_state.update_cursor(
+            &self.shared.cursor_manager,
+            inner.adapter.current_cursor.get(),
+            qh,
+        );
+    }
+
+    fn window_for(&self, surface: &wl_surface::WlSurface) -> Option<&WaylandWindow> {
+        self.surfaces.get(surface).and_then(|idx| self.windows.get(*idx))
+    }
+}
+
+pub(crate) fn start_event_loop(
+    handlers: &mut [Box<dyn WindowHandler>],
+) -> Result<(), Box<dyn Error>> {
+    ensure_app();
+    APP.with_borrow_mut(|slot| {
+        let mut app = slot.take().expect("slint-layer-shell app must be initialized");
+        let result = {
+            let App { event_loop, data, qh } = &mut app;
+            run_inner(event_loop, data, qh, handlers)
+        };
+        *slot = Some(app);
+        result
+    })
+}
+
+fn run_inner(
+    event_loop: &mut EventLoop<'static, AppData>,
+    data: &mut AppData,
+    qh: &Qh,
+    handlers: &mut [Box<dyn WindowHandler>],
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        // Sleep until the next timer, animation tick or wayland event:
+        // no polling, no fixed 16ms spin.
+        let timeout = TimerList::next_timeout().map(|deadline| {
+            let now = i_slint_core::animations::Instant::now();
+            if deadline > now {
+                std::time::Duration::from_millis(deadline.as_millis() - now.as_millis())
+            } else {
+                std::time::Duration::ZERO
+            }
+        });
+        event_loop.dispatch(timeout, data)?;
+        data.sweep(qh);
+        // Sweep callbacks (slint timers, queued tasks, WinHandle actions)
+        // may have queued calloop idle callbacks; flush them now instead of
+        // letting them wait for the next real wakeup.
+        event_loop.dispatch(Some(std::time::Duration::ZERO), data)?;
+        // The flush above can deliver more wayland events -> render again
+        // (cheap no-op when nothing is dirty).
+        data.sweep(qh);
+        for handler in handlers.iter_mut() {
+            handler.on_call()?;
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WinHandle {
+    pub(crate) handle: LoopHandle<'static, AppData>,
+    pub(crate) idx: usize,
+}
+
+impl WinHandle {
+    #[allow(clippy::redundant_closure_for_method_calls)]
+    fn with_window<F>(&self, f: F)
+    where
+        F: FnOnce(&WaylandWindow) + 'static,
+    {
+        let idx = self.idx;
+        self.handle.insert_idle(move |data: &mut AppData| {
+            if let Some(win) = data.windows.get(idx) {
+                f(win);
+            }
+        });
+    }
+
+    pub fn hide(&self) {
+        self.with_window(WaylandWindow::hide);
+    }
+
+    pub fn show_again(&self) {
+        self.with_window(WaylandWindow::show_again);
+    }
+
+    pub fn toggle(&self) {
+        self.with_window(WaylandWindow::toggle);
+    }
+
+    pub fn grab_focus(&self) {
+        self.with_window(WaylandWindow::grab_focus);
+    }
+
+    pub fn remove_focus(&self) {
+        self.with_window(WaylandWindow::remove_focus);
+    }
+
+    pub fn add_input_region(&self, x: i32, y: i32, width: i32, height: i32) {
+        self.with_window(move |win| win.add_input_region(x, y, width, height));
+    }
+
+    pub fn subtract_input_region(&self, x: i32, y: i32, width: i32, height: i32) {
+        self.with_window(move |win| win.subtract_input_region(x, y, width, height));
+    }
+
+    pub fn add_opaque_region(&self, x: i32, y: i32, width: i32, height: i32) {
+        self.with_window(move |win| win.add_opaque_region(x, y, width, height));
+    }
+
+    pub fn subtract_opaque_region(&self, x: i32, y: i32, width: i32, height: i32) {
+        self.with_window(move |win| win.subtract_opaque_region(x, y, width, height));
+    }
+
+    pub fn set_exclusive_zone(&self, val: i32) {
+        self.with_window(move |win| win.set_exclusive_zone(val));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delegates: implemented once on the shared AppData, routed by wl_surface.
+// ---------------------------------------------------------------------------
+
+impl ProvidesRegistryState for AppData {
     fn registry(&mut self) -> &mut RegistryState {
-        &mut self.states.registry_state
+        &mut self.shared.registry_state
     }
     fn runtime_add_global(
         &mut self,
@@ -488,27 +717,15 @@ impl ProvidesRegistryState for WaylandWindow {
     }
 }
 
-delegate_compositor!(WaylandWindow);
-delegate_registry!(WaylandWindow);
-delegate_output!(WaylandWindow);
-delegate_shm!(WaylandWindow);
-delegate_seat!(WaylandWindow);
-delegate_keyboard!(WaylandWindow);
-delegate_pointer!(WaylandWindow);
-delegate_touch!(WaylandWindow);
-delegate_layer!(WaylandWindow);
-delegate_fractional_scale!(WaylandWindow);
-delegate_viewporter!(WaylandWindow);
-
-impl ShmHandler for WaylandWindow {
+impl ShmHandler for AppData {
     fn shm_state(&mut self) -> &mut Shm {
-        &mut self.states.shm
+        &mut self.shared.shm
     }
 }
 
-impl OutputHandler for WaylandWindow {
+impl OutputHandler for AppData {
     fn output_state(&mut self) -> &mut OutputState {
-        &mut self.states.output_state
+        &mut self.shared.output_state
     }
 
     fn new_output(
@@ -539,7 +756,7 @@ impl OutputHandler for WaylandWindow {
     }
 }
 
-impl CompositorHandler for WaylandWindow {
+impl CompositorHandler for AppData {
     fn scale_factor_changed(
         &mut self,
         _: &Connection,
@@ -567,7 +784,7 @@ impl CompositorHandler for WaylandWindow {
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.converter(qh);
+        self.sweep(qh);
     }
 
     fn surface_enter(
@@ -591,110 +808,99 @@ impl CompositorHandler for WaylandWindow {
     }
 }
 
-impl FractionalScaleHandler for WaylandWindow {
+impl FractionalScaleHandler for AppData {
     fn preferred_scale(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         scale: u32,
     ) {
-        log::info!("Scale factor changed, invoked from custom trait. {}", scale);
-        let width_old = self.adapter.size_original.get().width;
-        let height_old = self.adapter.size_original.get().height;
-        self.layer.as_ref().unwrap().wl_surface().damage_buffer(
+        let Some(win) = self.window_for(surface) else { return };
+        let inner = &*win.0;
+        log::info!("[scale] {} preferred scale: {scale}", inner.span);
+
+        let size_old = inner.adapter.size_original.get();
+        inner.layer.wl_surface().damage_buffer(
             0,
             0,
-            self.adapter.size.get().width as i32,
-            self.adapter.size.get().height as i32,
-        );
-        let (buffer, width, height, scale_factor) = self.adapter.changed_scale_factor(scale);
-        self.config.width = width;
-        self.config.height = height;
-        self.buffer = buffer;
-        self.adapter
-            .try_dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor })
-            .unwrap();
-        self.states.viewporter.as_ref().unwrap().set_source(
-            0.,
-            0.,
-            self.adapter.size.get().width.into(),
-            self.adapter.size.get().height.into(),
+            inner.adapter.size.get().width as i32,
+            inner.adapter.size.get().height as i32,
         );
 
-        self.states
-            .viewporter
-            .as_ref()
-            .unwrap()
-            .set_destination(width_old as i32, height_old as i32);
-        self.adapter.request_redraw();
-        self.layer.as_ref().unwrap().commit();
+        let (buffer, width, height, scale_factor) = inner.adapter.changed_scale_factor(scale);
+        {
+            let mut config = inner.config.borrow_mut();
+            config.width = width;
+            config.height = height;
+        }
+        *inner.buffer.borrow_mut() = buffer;
+
+        inner
+            .adapter
+            .try_dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor })
+            .unwrap();
+
+        let size = inner.adapter.size.get();
+        inner.viewport.set_source(0., 0., size.width.into(), size.height.into());
+        inner.viewport.set_destination(size_old.width as i32, size_old.height as i32);
+
+        inner.adapter.request_redraw();
+        inner.layer.commit();
     }
 }
 
-impl LayerShellHandler for WaylandWindow {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        log::trace!("Closure of layer called");
+impl LayerShellHandler for AppData {
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        match self.window_for(layer.wl_surface()) {
+            Some(win) => log::info!("Win: {} layer closed", win.0.span),
+            None => log::trace!("Closure of unknown layer called"),
+        }
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         serial: u32,
     ) {
-        log::info!("[conf] {} serial={} size={}x{} hidden={}", self.span, serial, configure.new_size.0, configure.new_size.1, self.is_hidden.get());
-        self.converter(qh);
+        let Some(win) = self.window_for(layer.wl_surface()) else { return };
+        let inner = &*win.0;
+        inner.configured.set(true);
+        log::info!(
+            "[conf] {} serial={} size={}x{} hidden={}",
+            inner.span,
+            serial,
+            configure.new_size.0,
+            configure.new_size.1,
+            inner.is_hidden.get()
+        );
+        self.sweep(qh);
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct WinHandle(pub LoopHandle<'static, WaylandWindow>);
+delegate_compositor!(AppData);
+delegate_registry!(AppData);
+delegate_output!(AppData);
+delegate_shm!(AppData);
+delegate_seat!(AppData);
+delegate_keyboard!(AppData);
+delegate_pointer!(AppData);
+delegate_touch!(AppData);
+delegate_layer!(AppData);
+delegate_fractional_scale!(AppData);
+delegate_viewporter!(AppData);
 
-impl WinHandle {
-    pub fn hide(&self) {
-        self.0.insert_idle(|win| win.hide());
-    }
+// ---------------------------------------------------------------------------
+// Helpers used by slint_adapter before the loop starts running.
+// ---------------------------------------------------------------------------
 
-    pub fn show_again(&self) {
-        self.0.insert_idle(|win| win.show_again());
-    }
-
-    pub fn toggle(&self) {
-        self.0.insert_idle(|win| win.toggle());
-    }
-
-    pub fn grab_focus(&self) {
-        self.0.insert_idle(|win| win.grab_focus());
-    }
-
-    pub fn remove_focus(&self) {
-        self.0.insert_idle(|win| win.remove_focus());
-    }
-
-    pub fn add_input_region(&self, x: i32, y: i32, width: i32, height: i32) {
-        self.0
-            .insert_idle(move |win| win.add_input_region(x, y, width, height));
-    }
-
-    pub fn subtract_input_region(&self, x: i32, y: i32, width: i32, height: i32) {
-        self.0
-            .insert_idle(move |win| win.subtract_input_region(x, y, width, height));
-    }
-
-    pub fn add_opaque_region(&self, x: i32, y: i32, width: i32, height: i32) {
-        self.0
-            .insert_idle(move |win| win.add_opaque_region(x, y, width, height));
-    }
-
-    pub fn subtract_opaque_region(&self, x: i32, y: i32, width: i32, height: i32) {
-        self.0
-            .insert_idle(move |win| win.subtract_opaque_region(x, y, width, height));
-    }
-
-    pub fn set_exclusive_zone(&self, val: i32) {
-        self.0.insert_idle(move |win| win.set_exclusive_zone(val));
-    }
+/// Handles for the global slint task queue + wakeup fd.
+///
+/// Reads independent thread-locals so it is safe to call from inside
+/// `set_platform()` (i.e. while `APP` is borrowed by `ensure_app`).
+pub(crate) fn proxy_handles() -> (SlintTaskQueue, RawFd) {
+    (slint_task_queue(), slint_eventfd())
 }

@@ -1,14 +1,15 @@
 use crate::{
     layer_properties::WindowConf,
-    wayland_adapter::{WaylandWindow, slint_to_wl_cursor_mapping},
+    wayland_adapter::{AppData, Qh, slint_to_wl_cursor_mapping},
 };
 use i_slint_core::items::MouseCursor;
 use slint::{SharedString, platform::Key};
 use smithay_client_toolkit::{
     reexports::{
         calloop::{
-            EventLoop, Interest, Mode, PostAction,
+            Interest, Mode, PostAction,
             generic::Generic,
+            LoopHandle,
         },
         client::{
             QueueHandle,
@@ -132,24 +133,25 @@ pub(super) fn get_string(event: KeyEvent) -> SharedString {
 #[derive(Debug)]
 pub(crate) struct PointerState {
     pub pointer: Option<wl_pointer::WlPointer>,
-    pub cursor_shape: CursorShapeManager,
     pub current_wayland_cursor: MouseCursor,
     pub last_cursor_enter_serial: Option<u32>,
 }
 
 impl PointerState {
-    pub fn update_cursor(&mut self, mouse_cursor: MouseCursor, queue: &QueueHandle<WaylandWindow>) {
-        if self.last_cursor_enter_serial.is_some()
-            && self.pointer.is_some()
+    pub fn update_cursor(
+        &mut self,
+        cursor_shape: &CursorShapeManager,
+        mouse_cursor: MouseCursor,
+        queue: &QueueHandle<AppData>,
+    ) {
+        if let (Some(pointer), Some(serial)) =
+            (self.pointer.as_ref(), self.last_cursor_enter_serial)
             && mouse_cursor != self.current_wayland_cursor
         {
-            let pointer = self.pointer.as_ref().unwrap();
-            let serial = self.last_cursor_enter_serial.unwrap();
-
             if mouse_cursor == MouseCursor::None {
                 pointer.set_cursor(serial, None, 0, 0);
             } else {
-                self.cursor_shape
+                cursor_shape
                     .get_shape_device(pointer, queue)
                     .set_shape(
                         serial,
@@ -161,33 +163,20 @@ impl PointerState {
     }
 }
 
-fn drain_slint_events(data: &mut WaylandWindow) {
-    let proxy = data.adapter.slint_event_proxy.clone();
-    if let Ok(mut list) = proxy.try_lock()
-        && !(*list).is_empty()
-    {
-        let events: Vec<_> = (*list).drain(..).collect();
-        drop(list);
-        for event in events {
-            event();
-        }
-    }
-}
-
 pub(crate) fn set_event_sources(
-    event_loop: &EventLoop<'static, WaylandWindow>,
+    handle: LoopHandle<'static, AppData>,
     eventfd_fd: RawFd,
+    qh: Qh,
 ) {
-    event_loop
-        .handle()
+    handle
         .insert_source(
             Generic::new(unsafe { BorrowedFd::borrow_raw(eventfd_fd) }, Interest::READ, Mode::Level),
-            move |_, _, data| {
+            move |_, _, data: &mut AppData| {
                 let mut buf = [0u8; 8];
                 unsafe {
                     libc::read(eventfd_fd, buf.as_mut_ptr() as *mut libc::c_void, 8);
                 }
-                drain_slint_events(data);
+                data.sweep(&qh);
                 Ok(PostAction::Continue)
             },
         )
