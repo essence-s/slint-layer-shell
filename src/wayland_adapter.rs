@@ -148,6 +148,10 @@ pub(crate) struct WaylandWindowInner {
     /// True once the layer surface received its first configure; buffers may
     /// only be attached afterwards (protocol requirement).
     pub(crate) configured: Cell<bool>,
+    /// True while a committed frame awaits its `wl_surface.frame` ack. With a
+    /// single reused SHM buffer, writing again before the ack races against the
+    /// compositor still scanning the buffer out (tearing artifacts).
+    pub(crate) frame_pending: Cell<bool>,
     pub(crate) natural_scroll: bool,
     pub(crate) is_hidden: Cell<bool>,
     pub(crate) loop_handle: LoopHandle<'static, AppData>,
@@ -327,6 +331,7 @@ impl WaylandWindow {
             opaque_region,
             first_configure: Cell::new(true),
             configured: Cell::new(false),
+            frame_pending: Cell::new(false),
             natural_scroll,
             is_hidden: Cell::new(false),
             loop_handle: app.event_loop.handle(),
@@ -366,6 +371,7 @@ impl WaylandWindow {
             // round: attaching a buffer before it is a protocol error.
             inner.first_configure.set(true);
             inner.configured.set(false);
+            inner.frame_pending.set(false);
             inner.layer.commit();
         }
     }
@@ -528,6 +534,12 @@ impl AppData {
         if inner.is_hidden.get() || !inner.configured.get() {
             return;
         }
+        // A committed frame is still awaiting its frame() ack: reusing the SHM
+        // buffer now would write into memory the compositor may still be
+        // scanning out, producing tearing. Wait for the ack before drawing.
+        if inner.frame_pending.get() {
+            return;
+        }
         // Query the flags WITHOUT consuming them: draw_if_needed() consumes
         // needs_redraw itself and only paints when it was set.
         let first_configure = inner.first_configure.get();
@@ -561,13 +573,11 @@ impl AppData {
 
         surface.attach(Some(inner.buffer.borrow().wl_buffer()), 0, 0);
 
-        // Only keep requesting frame callbacks while there is queued work;
-        // otherwise let the whole process sleep until something happens.
-        let animating =
-            TimerList::next_timeout().is_some() || inner.adapter.needs_redraw.get();
-        if animating {
-            surface.frame(qh, surface.clone());
-        }
+        // Pacing: every real commit requests exactly one frame callback, so the
+        // next draw only happens after the compositor has consumed the previous
+        // buffer. Idle windows stay silent (early return above): zero wakeups.
+        surface.frame(qh, surface.clone());
+        inner.frame_pending.set(true);
         surface.commit();
 
         self.shared.pointer_state.update_cursor(
@@ -606,6 +616,11 @@ fn run_inner(
     loop {
         // Sleep until the next timer, animation tick or wayland event:
         // no polling, no fixed 16ms spin.
+        // `TimerList` no contempla animaciones activas: mientras alguna corra,
+        // despertar ~60Hz para avanzarla aunque no haya timer pendiente.
+        let animating =
+            data.windows.iter().any(|w| w.0.adapter.window.has_active_animations());
+        let poll = std::time::Duration::from_millis(16);
         let timeout = TimerList::next_timeout().map(|deadline| {
             let now = i_slint_core::animations::Instant::now();
             if deadline > now {
@@ -614,6 +629,13 @@ fn run_inner(
                 std::time::Duration::ZERO
             }
         });
+        // min(): un Timer más cercano nunca se retrasa por el poll.
+        let timeout = match timeout {
+            Some(t) if !animating => Some(t),
+            Some(t) => Some(t.min(poll)),
+            None if animating => Some(poll),
+            None => None,
+        };
         event_loop.dispatch(timeout, data)?;
         data.sweep(qh);
         // Sweep callbacks (slint timers, queued tasks, WinHandle actions)
@@ -781,9 +803,12 @@ impl CompositorHandler for AppData {
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
+        if let Some(win) = self.window_for(surface) {
+            win.0.frame_pending.set(false);
+        }
         self.sweep(qh);
     }
 
@@ -846,6 +871,7 @@ impl FractionalScaleHandler for AppData {
         inner.viewport.set_destination(size_old.width as i32, size_old.height as i32);
 
         inner.adapter.request_redraw();
+        inner.frame_pending.set(false);
         inner.layer.commit();
     }
 }
@@ -869,6 +895,8 @@ impl LayerShellHandler for AppData {
         let Some(win) = self.window_for(layer.wl_surface()) else { return };
         let inner = &*win.0;
         inner.configured.set(true);
+        // A fresh configure supersedes any outstanding frame ack for this layer.
+        inner.frame_pending.set(false);
         log::info!(
             "[conf] {} serial={} size={}x{} hidden={}",
             inner.span,

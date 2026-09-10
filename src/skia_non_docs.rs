@@ -176,6 +176,12 @@ impl SkiaWindowAdapter {
         &self,
         event: slint::platform::WindowEvent,
     ) -> Result<(), slint::PlatformError> {
+        // El reloj de animación de slint solo avanza en sweep(); tras un idle
+        // largo queda stale y una propiedad con `animate` calcularía
+        // (now - base_stale) >= duración, saltando al valor final. Refrescarlo
+        // aquí, justo antes de procesar el evento, es lo que exige el
+        // contrato del backend ("before rendering or processing input event").
+        slint::platform::update_timers_and_animations();
         self.window.try_dispatch_event(event)
     }
 
