@@ -100,6 +100,11 @@ impl PointerHandler for AppData {
                 }
                 PointerEventKind::Leave { .. } => {
                     log::info!("Pointer left {}", inner.span);
+                    // Sin esto Slint nunca resetea has-hover al salir de la superficie
+                    inner
+                        .adapter
+                        .try_dispatch_event(WindowEvent::PointerExited)
+                        .unwrap();
                     self.shared.pointer_state.last_cursor_enter_serial = None;
                     self.shared.pointer_state.pointer = None;
                 }
